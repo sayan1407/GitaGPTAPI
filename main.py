@@ -7,10 +7,19 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, OpenAI
 import json
+from contextlib import asynccontextmanager
+
+from database import init_db, save_user_if_new
+from auth import authenticate_google_user, get_google_login_url
 
 load_dotenv(override=True)
 
-app = FastAPI(title="GitaGPTAPI")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(title="GitaGPTAPI", lifespan=lifespan)
 
 origins = [
     "http://localhost",
@@ -108,3 +117,86 @@ async def chat(request: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+class GoogleAuthRequest(BaseModel):
+    token: str | None = None
+    credential: str | None = None
+    id_token: str | None = None
+    access_token: str | None = None
+    code: str | None = None
+    redirect_uri: str | None = None
+
+
+class GoogleAuthResponse(BaseModel):
+    username: str
+    email: str
+    is_new_user: bool | None = None
+    message: str | None = None
+
+
+@app.post("/auth/google", response_model=GoogleAuthResponse)
+async def google_auth(request: GoogleAuthRequest):
+    """
+    Authenticate a user via Google OAuth:
+    - Accepts an ID token / credential, access token, or authorization code.
+    - If it's a new user, saves username and email in Neon PostgreSQL.
+    - Returns the username and email address as response.
+    """
+    email, username = await authenticate_google_user(
+        token=request.token,
+        credential=request.credential,
+        id_token=request.id_token,
+        access_token=request.access_token,
+        code=request.code,
+        redirect_uri=request.redirect_uri,
+    )
+
+    user, is_new = save_user_if_new(email=email, username=username)
+
+    return GoogleAuthResponse(
+        username=user["username"],
+        email=user["email"],
+        is_new_user=is_new,
+        message="User registered successfully." if is_new else "User logged in successfully.",
+    )
+
+
+@app.api_route("/auth/google/callback", methods=["GET", "POST"], response_model=GoogleAuthResponse)
+async def google_auth_callback(
+    code: str | None = None,
+    token: str | None = None,
+    credential: str | None = None,
+    redirect_uri: str | None = None,
+):
+    """
+    Handles Google OAuth redirect callbacks:
+    - Accepts authorization code or token via query parameters.
+    - If it's a new user, saves username and email in Neon PostgreSQL.
+    - Returns the username and email address as response.
+    """
+    email, username = await authenticate_google_user(
+        token=token,
+        credential=credential,
+        code=code,
+        redirect_uri=redirect_uri,
+    )
+
+    user, is_new = save_user_if_new(email=email, username=username)
+
+    return GoogleAuthResponse(
+        username=user["username"],
+        email=user["email"],
+        is_new_user=is_new,
+        message="User registered successfully." if is_new else "User logged in successfully.",
+    )
+
+
+@app.get("/auth/google/login")
+async def google_login(redirect_uri: str | None = None, state: str | None = None):
+    """
+    Returns the Google OAuth consent URL for client redirection.
+    """
+    login_url = get_google_login_url(redirect_uri=redirect_uri, state=state)
+    return {"login_url": login_url}
+
