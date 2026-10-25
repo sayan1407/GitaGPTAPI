@@ -89,3 +89,41 @@ def test_get_callback_endpoint():
                 cur.execute("DELETE FROM users WHERE LOWER(email) = %s;", (test_email.lower(),))
             conn.commit()
 
+
+
+def test_oauth_callback_post_body_and_jwt_issuance():
+    """
+    Verifies that:
+    1. POST /auth/google/callback accepts JSON body {'code': '...'} (fixing CWE-598).
+    2. Response includes a valid signed JWT access token in 'access_token' and 'token'.
+    """
+    client = TestClient(app)
+    unique_id = uuid.uuid4().hex[:8]
+    test_email = f"cb_body_{unique_id}@example.com"
+    test_username = f"Callback Body User {unique_id}"
+
+    with patch("main.authenticate_google_user", new_callable=AsyncMock) as mock_auth:
+        mock_auth.return_value = (test_email, test_username)
+
+        # Send authorization code in POST JSON body
+        response = client.post("/auth/google/callback", json={"code": f"mock_code_{unique_id}"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["email"] == test_email
+        assert data["username"] == test_username
+        assert "access_token" in data
+        assert data["access_token"] is not None
+        assert data["token"] == data["access_token"]
+        assert data["token_type"] == "bearer"
+
+        # Verify issued token can be decoded with verify_user_access_token
+        from auth import verify_user_access_token
+        payload = verify_user_access_token(data["access_token"])
+        assert payload["email"] == test_email
+        assert payload["username"] == test_username
+
+        # Cleanup
+        with database.get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM users WHERE LOWER(email) = %s;", (test_email.lower(),))
+            conn.commit()

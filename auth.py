@@ -1,5 +1,7 @@
 import os
+import datetime
 import httpx
+import jwt
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 from fastapi import HTTPException, status
@@ -10,6 +12,47 @@ load_dotenv(override=True)
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
+
+JWT_SECRET = os.getenv("JWT_SECRET") or GOOGLE_CLIENT_SECRET or "gitagpt_jwt_default_secret_key_change_in_production"
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_DAYS = 30
+
+
+def create_user_access_token(email: str, username: str) -> str:
+    """
+    Creates a signed JWT access token for the authenticated user.
+    """
+    clean_email = email.strip().lower()
+    clean_username = username.strip() if username else clean_email.split("@")[0]
+    payload = {
+        "sub": clean_email,
+        "email": clean_email,
+        "username": clean_username,
+        "iat": datetime.datetime.now(datetime.timezone.utc),
+        "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=JWT_EXPIRATION_DAYS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def verify_user_access_token(token: str) -> dict:
+    """
+    Verifies the JWT access token and returns payload.
+    Raises HTTPException(401) on failure.
+    """
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session token has expired. Please log in again.",
+        )
+    except jwt.PyJWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid authentication token: {str(e)}",
+        )
+
 
 
 async def verify_google_id_token(token: str) -> dict:

@@ -155,3 +155,75 @@ def test_chat_history_full_lifecycle():
         with conn.cursor() as cur:
             cur.execute("DELETE FROM users WHERE LOWER(email) = %s;", (test_email.lower(),))
         conn.commit()
+
+
+def test_bola_idor_protection_and_bearer_auth():
+    """
+    Verifies that:
+    1. Authenticated user can manage sessions via Bearer token without needing user_email.
+    2. Attempting to access/modify another user's sessions using a different user_email is blocked with 403 Forbidden.
+    3. Invalid or forged tokens return 401 Unauthorized.
+    """
+    from auth import create_user_access_token
+    client = TestClient(app)
+    uid_a = uuid.uuid4().hex[:8]
+    uid_b = uuid.uuid4().hex[:8]
+    email_a = f"user_a_{uid_a}@example.com"
+    email_b = f"user_b_{uid_b}@example.com"
+    token_a = create_user_access_token(email_a, f"User A {uid_a}")
+    token_b = create_user_access_token(email_b, f"User B {uid_b}")
+
+    headers_a = {"Authorization": f"Bearer {token_a}"}
+    headers_b = {"Authorization": f"Bearer {token_b}"}
+
+    # 1. User A creates a session using Bearer token
+    session_id = f"sess_a_{uid_a}"
+    now_ms = int(time.time() * 1000)
+    res = client.put(
+        f"/sessions/{session_id}",
+        headers=headers_a,
+        json={
+            "session": {
+                "id": session_id,
+                "title": "User A Private Session",
+                "createdAt": now_ms,
+                "updatedAt": now_ms,
+                "messages": [
+                    {
+                        "id": f"msg_a_{uid_a}",
+                        "role": "user",
+                        "content": "Secret query by User A",
+                        "timestamp": now_ms,
+                    }
+                ],
+            }
+        },
+    )
+    assert res.status_code == 200
+
+    # 2. User A retrieves sessions with Bearer token (no user_email param needed)
+    res = client.get("/sessions", headers=headers_a)
+    assert res.status_code == 200
+    sessions_a = res.json()
+    assert len(sessions_a) == 1
+    assert sessions_a[0]["title"] == "User A Private Session"
+
+    # 3. User B cannot see User A's session
+    res = client.get("/sessions", headers=headers_b)
+    assert res.status_code == 200
+    assert res.json() == []
+
+    # 4. BOLA / IDOR Attack: User A tries to tamper with User B's account by sending user_email=email_b
+    res = client.get(f"/sessions?user_email={email_b}", headers=headers_a)
+    assert res.status_code == 403
+    assert "Cannot access or modify another user's sessions" in res.json()["detail"]
+
+    # 5. Invalid token returns 401
+    res = client.get("/sessions", headers={"Authorization": "Bearer invalid_forged_token"})
+    assert res.status_code == 401
+
+    # Cleanup
+    with database.get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM users WHERE LOWER(email) IN (%s, %s);", (email_a.lower(), email_b.lower()))
+        conn.commit()
