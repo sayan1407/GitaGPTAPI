@@ -9,7 +9,17 @@ from openai import AsyncOpenAI, OpenAI
 import json
 from contextlib import asynccontextmanager
 
-from database import init_db, save_user_if_new
+from database import (
+    init_db,
+    save_user_if_new,
+    get_user_sessions,
+    upsert_session,
+    save_message,
+    update_session,
+    delete_session,
+    clear_user_sessions,
+    batch_sync_sessions,
+)
 from auth import authenticate_google_user, get_google_login_url
 
 load_dotenv(override=True)
@@ -199,4 +209,133 @@ async def google_login(redirect_uri: str | None = None, state: str | None = None
     """
     login_url = get_google_login_url(redirect_uri=redirect_uri, state=state)
     return {"login_url": login_url}
+
+
+# ---------------------------------------------------------
+# Chat History Persistence Endpoints
+# ---------------------------------------------------------
+
+class MessageModel(BaseModel):
+    id: str
+    role: str
+    content: str
+    timestamp: int
+    responseId: str | None = None
+    response_id: str | None = None
+    isStreaming: bool | None = False
+    error: bool | None = False
+
+
+class ChatSessionModel(BaseModel):
+    id: str
+    title: str = "New Conversation"
+    createdAt: int | None = None
+    created_at: int | None = None
+    updatedAt: int | None = None
+    updated_at: int | None = None
+    previousResponseId: str | None = None
+    previous_response_id: str | None = None
+    messages: list[MessageModel] = []
+
+
+class SessionSaveRequest(BaseModel):
+    user_email: str
+    session: ChatSessionModel
+
+
+class MessageSaveRequest(BaseModel):
+    user_email: str
+    message: MessageModel
+
+
+class SessionUpdateRequest(BaseModel):
+    user_email: str
+    title: str | None = None
+    previous_response_id: str | None = None
+    updated_at: int | None = None
+
+
+class BatchSyncRequest(BaseModel):
+    user_email: str
+    sessions: list[ChatSessionModel]
+
+
+@app.get("/sessions")
+async def get_sessions(user_email: str):
+    """Retrieves all chat sessions and their messages for a user."""
+    if not user_email:
+        raise HTTPException(status_code=400, detail="user_email query parameter is required")
+    return get_user_sessions(user_email)
+
+
+@app.post("/sessions")
+async def create_session(payload: SessionSaveRequest):
+    """Creates or updates a chat session for a user."""
+    if not payload.user_email:
+        raise HTTPException(status_code=400, detail="user_email is required")
+    return upsert_session(payload.user_email, payload.session.model_dump())
+
+
+@app.put("/sessions/{session_id}")
+async def update_full_session(session_id: str, payload: SessionSaveRequest):
+    """Upserts a full session and all its messages."""
+    if not payload.user_email:
+        raise HTTPException(status_code=400, detail="user_email is required")
+    data = payload.session.model_dump()
+    data["id"] = session_id
+    return upsert_session(payload.user_email, data)
+
+
+@app.patch("/sessions/{session_id}")
+async def patch_session_metadata(session_id: str, payload: SessionUpdateRequest):
+    """Updates session title, previous_response_id, or updated_at."""
+    if not payload.user_email:
+        raise HTTPException(status_code=400, detail="user_email is required")
+    success = update_session(
+        user_email=payload.user_email,
+        session_id=session_id,
+        title=payload.title,
+        previous_response_id=payload.previous_response_id,
+        updated_at=payload.updated_at,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or user mismatch")
+    return {"success": True, "session_id": session_id}
+
+
+@app.post("/sessions/{session_id}/messages")
+async def add_session_message(session_id: str, payload: MessageSaveRequest):
+    """Adds or updates a single message in a session."""
+    if not payload.user_email:
+        raise HTTPException(status_code=400, detail="user_email is required")
+    return save_message(payload.user_email, session_id, payload.message.model_dump())
+
+
+@app.delete("/sessions/{session_id}")
+async def remove_session(session_id: str, user_email: str):
+    """Deletes a specific session and all its messages."""
+    if not user_email:
+        raise HTTPException(status_code=400, detail="user_email is required")
+    success = delete_session(user_email, session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or user mismatch")
+    return {"success": True, "deleted_session_id": session_id}
+
+
+@app.delete("/sessions")
+async def clear_all_sessions(user_email: str):
+    """Deletes all sessions belonging to the user."""
+    if not user_email:
+        raise HTTPException(status_code=400, detail="user_email is required")
+    count = clear_user_sessions(user_email)
+    return {"success": True, "deleted_count": count}
+
+
+@app.post("/sessions/sync")
+async def sync_sessions(payload: BatchSyncRequest):
+    """Syncs a batch of sessions (e.g. initial localStorage migration to database)."""
+    if not payload.user_email:
+        raise HTTPException(status_code=400, detail="user_email is required")
+    return batch_sync_sessions(payload.user_email, [s.model_dump() for s in payload.sessions])
+
 
