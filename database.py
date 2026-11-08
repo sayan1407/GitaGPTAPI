@@ -71,11 +71,15 @@ def init_db():
         content TEXT NOT NULL,
         timestamp BIGINT NOT NULL,
         response_id VARCHAR(255),
-        error BOOLEAN DEFAULT FALSE
+        error BOOLEAN DEFAULT FALSE,
+        order_index INTEGER NOT NULL DEFAULT 0
     );
+
+    ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS order_index INTEGER NOT NULL DEFAULT 0;
 
     CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id);
     CREATE INDEX IF NOT EXISTS idx_chat_messages_timestamp ON chat_messages(timestamp ASC);
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_session_order ON chat_messages(session_id, order_index ASC);
     """
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -190,10 +194,10 @@ def get_user_sessions(user_email: str) -> list[dict]:
             session_ids = [s["id"] for s in sessions]
             cur.execute(
                 """
-                SELECT id, session_id, role, content, timestamp, response_id, error
+                SELECT id, session_id, role, content, timestamp, response_id, error, order_index
                 FROM chat_messages
                 WHERE session_id = ANY(%s)
-                ORDER BY timestamp ASC;
+                ORDER BY order_index ASC, timestamp ASC;
                 """,
                 (session_ids,),
             )
@@ -211,6 +215,7 @@ def get_user_sessions(user_email: str) -> list[dict]:
                         "timestamp": int(msg["timestamp"]),
                         "responseId": msg["response_id"],
                         "error": bool(msg["error"]),
+                        "orderIndex": int(msg["order_index"]) if msg.get("order_index") is not None else 0,
                     })
 
             result = []
@@ -266,25 +271,31 @@ def upsert_session(user_email: str, session: dict, conn=None) -> dict:
 
             messages = session.get("messages", [])
             saved_messages = []
-            for msg in messages:
+            for idx, msg in enumerate(messages):
                 msg_id = msg["id"]
                 role = msg["role"]
                 content = msg["content"]
                 timestamp = int(msg.get("timestamp") or current_ms)
                 response_id = msg.get("responseId") or msg.get("response_id")
                 error = bool(msg.get("error", False))
+                order_index = msg.get("orderIndex")
+                if order_index is None:
+                    order_index = msg.get("order_index")
+                if order_index is None:
+                    order_index = idx
 
                 cur.execute(
                     """
-                    INSERT INTO chat_messages (id, session_id, role, content, timestamp, response_id, error)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO chat_messages (id, session_id, role, content, timestamp, response_id, error, order_index)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
                         content = EXCLUDED.content,
                         response_id = EXCLUDED.response_id,
-                        error = EXCLUDED.error
-                    RETURNING id, role, content, timestamp, response_id, error;
+                        error = EXCLUDED.error,
+                        order_index = EXCLUDED.order_index
+                    RETURNING id, role, content, timestamp, response_id, error, order_index;
                     """,
-                    (msg_id, session_id, role, content, timestamp, response_id, error),
+                    (msg_id, session_id, role, content, timestamp, response_id, error, int(order_index)),
                 )
                 m_row = cur.fetchone()
                 saved_messages.append({
@@ -294,6 +305,7 @@ def upsert_session(user_email: str, session: dict, conn=None) -> dict:
                     "timestamp": int(m_row["timestamp"]),
                     "responseId": m_row["response_id"],
                     "error": bool(m_row["error"]),
+                    "orderIndex": int(m_row["order_index"]),
                 })
 
             if conn is None:
@@ -329,6 +341,9 @@ def save_message(user_email: str, session_id: str, message: dict) -> dict:
     timestamp = int(message.get("timestamp") or current_ms)
     response_id = message.get("responseId") or message.get("response_id")
     error = bool(message.get("error", False))
+    order_index = message.get("orderIndex")
+    if order_index is None:
+        order_index = message.get("order_index")
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -355,17 +370,25 @@ def save_message(user_email: str, session_id: str, message: dict) -> dict:
                 if not check_sess or check_sess["user_id"] != user_id:
                     raise PermissionError("Access denied: Cannot add messages to another user's session.")
 
+            if order_index is None:
+                cur.execute(
+                    "SELECT COALESCE(MAX(order_index), -1) + 1 AS next_idx FROM chat_messages WHERE session_id = %s;",
+                    (session_id,),
+                )
+                order_index = cur.fetchone()["next_idx"]
+
             cur.execute(
                 """
-                INSERT INTO chat_messages (id, session_id, role, content, timestamp, response_id, error)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO chat_messages (id, session_id, role, content, timestamp, response_id, error, order_index)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     content = EXCLUDED.content,
                     response_id = EXCLUDED.response_id,
-                    error = EXCLUDED.error
-                RETURNING id, role, content, timestamp, response_id, error;
+                    error = EXCLUDED.error,
+                    order_index = EXCLUDED.order_index
+                RETURNING id, role, content, timestamp, response_id, error, order_index;
                 """,
-                (msg_id, session_id, role, content, timestamp, response_id, error),
+                (msg_id, session_id, role, content, timestamp, response_id, error, int(order_index)),
             )
             m_row = cur.fetchone()
 
@@ -397,6 +420,7 @@ def save_message(user_email: str, session_id: str, message: dict) -> dict:
         "timestamp": int(m_row["timestamp"]),
         "responseId": m_row["response_id"],
         "error": bool(m_row["error"]),
+        "orderIndex": int(m_row["order_index"]),
     }
 
 

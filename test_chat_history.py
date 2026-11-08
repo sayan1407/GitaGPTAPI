@@ -247,3 +247,100 @@ def test_bola_idor_protection_and_bearer_auth():
         with conn.cursor() as cur:
             cur.execute("DELETE FROM users WHERE LOWER(email) IN (%s, %s);", (email_a.lower(), email_b.lower()))
         conn.commit()
+
+
+def test_message_ordering_with_identical_timestamps():
+    """
+    Verifies that messages within a session are ordered strictly by order_index,
+    even when timestamps are completely identical and assistant ID alphabetically precedes user ID.
+    """
+    from auth import create_user_access_token
+    client = TestClient(app)
+    uid = uuid.uuid4().hex[:8]
+    test_email = f"order_user_{uid}@example.com"
+    token = create_user_access_token(test_email, f"Order User {uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_id = f"sess_order_{uid}"
+    # 'a' comes before 'u' alphabetically to ensure ID sort would fail without order_index
+    msg_asst_id = f"msg_asst_{uid}"
+    msg_user_id = f"msg_user_{uid}"
+
+    identical_timestamp = 1730000000000
+
+    session_payload = {
+        "session": {
+            "id": session_id,
+            "title": "Order Test Conversation",
+            "createdAt": identical_timestamp,
+            "updatedAt": identical_timestamp,
+            "messages": [
+                {
+                    "id": msg_user_id,
+                    "role": "user",
+                    "content": "First message from user",
+                    "timestamp": identical_timestamp,
+                    "orderIndex": 0,
+                },
+                {
+                    "id": msg_asst_id,
+                    "role": "assistant",
+                    "content": "Second message from assistant",
+                    "timestamp": identical_timestamp,
+                    "orderIndex": 1,
+                },
+            ],
+        },
+    }
+
+    # Upsert session
+    res = client.put(f"/sessions/{session_id}", headers=headers, json=session_payload)
+    assert res.status_code == 200
+
+    # Fetch sessions and verify message sequence
+    res = client.get("/sessions", headers=headers)
+    assert res.status_code == 200
+    sessions = res.json()
+    assert len(sessions) == 1
+    msgs = sessions[0]["messages"]
+    assert len(msgs) == 2
+    assert msgs[0]["id"] == msg_user_id
+    assert msgs[0]["role"] == "user"
+    assert msgs[0]["orderIndex"] == 0
+    assert msgs[1]["id"] == msg_asst_id
+    assert msgs[1]["role"] == "assistant"
+    assert msgs[1]["orderIndex"] == 1
+
+    # Add a third message with the same timestamp via POST
+    msg3_id = f"msg_user_third_{uid}"
+    post_res = client.post(
+        f"/sessions/{session_id}/messages",
+        headers=headers,
+        json={
+            "message": {
+                "id": msg3_id,
+                "role": "user",
+                "content": "Third message",
+                "timestamp": identical_timestamp,
+            }
+        },
+    )
+    assert post_res.status_code == 200
+    assert post_res.json()["orderIndex"] == 2
+
+    # Fetch again and ensure third message is in 3rd place
+    res = client.get("/sessions", headers=headers)
+    assert res.status_code == 200
+    msgs = res.json()[0]["messages"]
+    assert len(msgs) == 3
+    assert msgs[0]["role"] == "user"
+    assert msgs[1]["role"] == "assistant"
+    assert msgs[2]["id"] == msg3_id
+    assert msgs[2]["orderIndex"] == 2
+
+    # Cleanup
+    with database.get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM users WHERE LOWER(email) = %s;", (test_email.lower(),))
+        conn.commit()
+

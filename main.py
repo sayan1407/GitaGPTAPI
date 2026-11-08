@@ -333,6 +333,8 @@ class MessageModel(BaseModel):
     response_id: str | None = None
     isStreaming: bool | None = False
     error: bool | None = False
+    orderIndex: int | None = None
+    order_index: int | None = None
 
 
 class ChatSessionModel(BaseModel):
