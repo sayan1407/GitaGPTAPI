@@ -12,9 +12,13 @@ def setup_db():
 
 
 def test_chat_history_full_lifecycle():
+    from auth import create_user_access_token
     client = TestClient(app)
     uid = uuid.uuid4().hex[:8]
     test_email = f"chat_user_{uid}@example.com"
+    token = create_user_access_token(test_email, f"Chat User {uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
     session_id = f"sess_{uid}"
     msg1_id = f"msg_u_{uid}"
     msg2_id = f"msg_a_{uid}"
@@ -22,13 +26,12 @@ def test_chat_history_full_lifecycle():
     now_ms = int(time.time() * 1000)
 
     # 1. Initially user should have no sessions
-    res = client.get(f"/sessions?user_email={test_email}")
+    res = client.get("/sessions", headers=headers)
     assert res.status_code == 200
     assert res.json() == []
 
     # 2. Create a session with 2 messages via PUT /sessions/{session_id}
     session_payload = {
-        "user_email": test_email,
         "session": {
             "id": session_id,
             "title": "Initial Conversation",
@@ -52,7 +55,7 @@ def test_chat_history_full_lifecycle():
             ],
         },
     }
-    res = client.put(f"/sessions/{session_id}", json=session_payload)
+    res = client.put(f"/sessions/{session_id}", headers=headers, json=session_payload)
     assert res.status_code == 200
     data = res.json()
     assert data["id"] == session_id
@@ -60,7 +63,7 @@ def test_chat_history_full_lifecycle():
     assert len(data["messages"]) == 2
 
     # 3. GET /sessions should now return the session
-    res = client.get(f"/sessions?user_email={test_email}")
+    res = client.get("/sessions", headers=headers)
     assert res.status_code == 200
     sessions = res.json()
     assert len(sessions) == 1
@@ -72,7 +75,6 @@ def test_chat_history_full_lifecycle():
     # 4. Add a third message via POST /sessions/{session_id}/messages
     msg3_id = f"msg_u2_{uid}"
     msg_payload = {
-        "user_email": test_email,
         "message": {
             "id": msg3_id,
             "role": "user",
@@ -80,40 +82,38 @@ def test_chat_history_full_lifecycle():
             "timestamp": now_ms + 200,
         },
     }
-    res = client.post(f"/sessions/{session_id}/messages", json=msg_payload)
+    res = client.post(f"/sessions/{session_id}/messages", headers=headers, json=msg_payload)
     assert res.status_code == 200
     msg_data = res.json()
     assert msg_data["id"] == msg3_id
     assert msg_data["content"] == "Which chapter discusses this?"
 
     # Verify message count increased to 3
-    res = client.get(f"/sessions?user_email={test_email}")
+    res = client.get("/sessions", headers=headers)
     sessions = res.json()
     assert len(sessions[0]["messages"]) == 3
 
     # 5. Rename session via PATCH /sessions/{session_id}
     patch_payload = {
-        "user_email": test_email,
         "title": "Bhakti Yoga Chapter Discussion",
     }
-    res = client.patch(f"/sessions/{session_id}", json=patch_payload)
+    res = client.patch(f"/sessions/{session_id}", headers=headers, json=patch_payload)
     assert res.status_code == 200
 
-    res = client.get(f"/sessions?user_email={test_email}")
+    res = client.get("/sessions", headers=headers)
     sessions = res.json()
     assert sessions[0]["title"] == "Bhakti Yoga Chapter Discussion"
 
     # 6. Delete the session via DELETE /sessions/{session_id}
-    res = client.delete(f"/sessions/{session_id}?user_email={test_email}")
+    res = client.delete(f"/sessions/{session_id}", headers=headers)
     assert res.status_code == 200
 
-    res = client.get(f"/sessions?user_email={test_email}")
+    res = client.get("/sessions", headers=headers)
     assert res.json() == []
 
     # 7. Test batch sync (localStorage migration)
     sync_session_id = f"sync_sess_{uid}"
     batch_payload = {
-        "user_email": test_email,
         "sessions": [
             {
                 "id": sync_session_id,
@@ -132,22 +132,22 @@ def test_chat_history_full_lifecycle():
             }
         ],
     }
-    res = client.post("/sessions/sync", json=batch_payload)
+    res = client.post("/sessions/sync", headers=headers, json=batch_payload)
     assert res.status_code == 200
     synced = res.json()
     assert len(synced) == 1
     assert synced[0]["title"] == "Migrated from LocalStorage"
 
     # Verify synced session appears
-    res = client.get(f"/sessions?user_email={test_email}")
+    res = client.get("/sessions", headers=headers)
     assert len(res.json()) == 1
 
     # 8. Clear all sessions via DELETE /sessions
-    res = client.delete(f"/sessions?user_email={test_email}")
+    res = client.delete("/sessions", headers=headers)
     assert res.status_code == 200
     assert res.json()["deleted_count"] >= 1
 
-    res = client.get(f"/sessions?user_email={test_email}")
+    res = client.get("/sessions", headers=headers)
     assert res.json() == []
 
     # Cleanup user
@@ -218,7 +218,27 @@ def test_bola_idor_protection_and_bearer_auth():
     assert res.status_code == 403
     assert "Cannot access or modify another user's sessions" in res.json()["detail"]
 
-    # 5. Invalid token returns 401
+    # 5. BOLA Cross-User Overwrite: User B tries to overwrite User A's existing session
+    res = client.put(
+        f"/sessions/{session_id}",
+        headers=headers_b,
+        json={"session": {"id": session_id, "title": "Maliciously Overwritten Session"}},
+    )
+    assert res.status_code == 403
+
+    # 6. BOLA Cross-User Injection: User B tries to inject messages into User A's session
+    res = client.post(
+        f"/sessions/{session_id}/messages",
+        headers=headers_b,
+        json={"message": {"id": f"msg_evil_{uid_b}", "role": "user", "content": "Injected message", "timestamp": now_ms}},
+    )
+    assert res.status_code == 403
+
+    # 7. Unauthenticated access without token is rejected with 401 (VULN-01 fix verification)
+    res = client.get(f"/sessions?user_email={email_a}")
+    assert res.status_code == 401
+
+    # 8. Invalid token returns 401
     res = client.get("/sessions", headers={"Authorization": "Bearer invalid_forged_token"})
     assert res.status_code == 401
 

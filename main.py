@@ -1,5 +1,7 @@
 import os
 import time
+from collections import defaultdict
+from threading import Lock
 from fastapi import FastAPI, HTTPException, Header, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -57,6 +59,28 @@ app.add_middleware(
 
 client = AsyncOpenAI()
 
+class RateLimiter:
+    """Thread-safe sliding window rate limiter."""
+    def __init__(self, requests_per_minute: int = 30):
+        self.requests_per_minute = requests_per_minute
+        self.requests = defaultdict(list)
+        self.lock = Lock()
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        window_start = now - 60
+        with self.lock:
+            timestamps = [t for t in self.requests[key] if t > window_start]
+            if len(timestamps) >= self.requests_per_minute:
+                self.requests[key] = timestamps
+                return False
+            timestamps.append(now)
+            self.requests[key] = timestamps
+            return True
+
+
+chat_limiter = RateLimiter(requests_per_minute=30)
+
 guardrail_agent_instruction = """
 You are a gurdrail agent that verifies if the user input is appropiate to ask to a Bhagavad Gita scholar. 
 You should check if the user input is about dealing with personal problem, spiritual guidance, or questions related to the Bhagavad Gita. 
@@ -91,12 +115,32 @@ instruction = """
 """
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, req: Request):
+    client_ip = req.client.host if req.client else "unknown"
+    if not chat_limiter.is_allowed(client_ip):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Please wait a moment before sending another message.",
+        )
+
+    # Await guardrail BEFORE starting streaming response
+    try:
+        is_valid_input = await guardrail_valid_input(request.message)
+    except Exception as e:
+        print(f"Guardrail evaluation error: {e}", flush=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Guardrail validation service temporarily unavailable.",
+        )
+
+    if not is_valid_input:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid input. Please ask questions related to Bhagavad Gita or personal guidance.",
+        )
+
     async def generate():
         print("Generator started", flush=True)
-        is_valid_input = guardrail_valid_input(request.message)
-        if not is_valid_input:
-            raise HTTPException(status_code=400, detail="Invalid input. Please ask questions related to Bhagavad Gita or personal guidance.")
         try:
             stream = await client.responses.create(
                 instructions=instruction,
@@ -250,37 +294,34 @@ async def get_current_user_email(
 ) -> str:
     """
     Validates token and returns authenticated user email.
-    Enforces authorization to prevent BOLA / IDOR.
+    Enforces authentication and authorization to prevent BOLA / IDOR.
     """
-    if authorization:
-        parts = authorization.split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            token = parts[1]
-        else:
-            token = authorization
-        payload = verify_user_access_token(token)
-        token_email = payload.get("email") or payload.get("sub")
-        if not token_email:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token payload is missing user identity",
-            )
-        # Prevent BOLA/IDOR: If user_email is also provided, ensure it matches the token
-        if user_email and user_email.strip().lower() != token_email.strip().lower():
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied: Cannot access or modify another user's sessions.",
-            )
-        return token_email.strip().lower()
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required. Please provide a valid Bearer token.",
+        )
 
-    # Fallback for unauthenticated legacy calls / backwards compatibility
-    if user_email and user_email.strip():
-        return user_email.strip().lower()
-
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Authentication required. Please provide a Bearer token or user_email.",
-    )
+    parts = authorization.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        token = parts[1]
+    else:
+        token = authorization
+    payload = verify_user_access_token(token)
+    token_email = payload.get("email") or payload.get("sub")
+    if not token_email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token payload is missing user identity",
+        )
+    token_email = token_email.strip().lower()
+    # Prevent BOLA/IDOR: If user_email is also provided, ensure it matches the token
+    if user_email and user_email.strip().lower() != token_email:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Cannot access or modify another user's sessions.",
+        )
+    return token_email
 
 
 class MessageModel(BaseModel):
@@ -345,7 +386,10 @@ async def create_session(
 ):
     """Creates or updates a chat session for a user."""
     effective_email = await get_current_user_email(authorization, payload.user_email)
-    return upsert_session(effective_email, payload.session.model_dump())
+    try:
+        return upsert_session(effective_email, payload.session.model_dump())
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
 
 @app.put("/sessions/{session_id}")
@@ -358,7 +402,10 @@ async def update_full_session(
     effective_email = await get_current_user_email(authorization, payload.user_email)
     data = payload.session.model_dump()
     data["id"] = session_id
-    return upsert_session(effective_email, data)
+    try:
+        return upsert_session(effective_email, data)
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
 
 @app.patch("/sessions/{session_id}")
@@ -389,7 +436,10 @@ async def add_session_message(
 ):
     """Adds or updates a single message in a session."""
     effective_email = await get_current_user_email(authorization, payload.user_email)
-    return save_message(effective_email, session_id, payload.message.model_dump())
+    try:
+        return save_message(effective_email, session_id, payload.message.model_dump())
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
 
 @app.delete("/sessions/{session_id}")
@@ -424,4 +474,7 @@ async def sync_sessions(
 ):
     """Syncs a batch of sessions (e.g. initial localStorage migration to database)."""
     effective_email = await get_current_user_email(authorization, payload.user_email)
-    return batch_sync_sessions(effective_email, [s.model_dump() for s in payload.sessions])
+    try:
+        return batch_sync_sessions(effective_email, [s.model_dump() for s in payload.sessions])
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))

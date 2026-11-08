@@ -13,7 +13,15 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
 
-JWT_SECRET = os.getenv("JWT_SECRET") or GOOGLE_CLIENT_SECRET or "gitagpt_jwt_default_secret_key_change_in_production"
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    # Fall back to GOOGLE_CLIENT_SECRET if configured, but prevent insecure default string
+    JWT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+    if not JWT_SECRET:
+        raise RuntimeError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: 'JWT_SECRET' environment variable is not set. "
+            "Please configure JWT_SECRET in your environment or .env file."
+        )
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DAYS = 30
 
@@ -60,14 +68,26 @@ async def verify_google_id_token(token: str) -> dict:
     Verifies a Google ID Token (JWT) either locally using Google public certs
     or via Google's tokeninfo API.
     """
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="GOOGLE_CLIENT_ID is not configured on the server.",
+        )
+
     # Attempt verification using google-auth library
     try:
         req = google_requests.Request()
-        audience = GOOGLE_CLIENT_ID if GOOGLE_CLIENT_ID else None
-        payload = google_id_token.verify_oauth2_token(token, req, audience=audience)
+        payload = google_id_token.verify_oauth2_token(token, req, audience=GOOGLE_CLIENT_ID)
         if payload.get("iss") not in ["accounts.google.com", "https://accounts.google.com"]:
             raise ValueError("Token issuer is not Google")
+        if not payload.get("email_verified", False):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Google account email is not verified.",
+            )
         return payload
+    except HTTPException:
+        raise
     except Exception:
         pass
 
@@ -81,10 +101,15 @@ async def verify_google_id_token(token: str) -> dict:
             )
             if resp.status_code == 200:
                 payload = resp.json()
-                if GOOGLE_CLIENT_ID and payload.get("aud") != GOOGLE_CLIENT_ID:
+                if payload.get("aud") != GOOGLE_CLIENT_ID:
                     raise HTTPException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         detail="Google token audience mismatch",
+                    )
+                if str(payload.get("email_verified", "")).lower() != "true":
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Google account email is not verified.",
                     )
                 return payload
             else:
@@ -115,7 +140,14 @@ async def verify_google_access_token(token: str) -> dict:
                 timeout=10.0,
             )
             if resp.status_code == 200:
-                return resp.json()
+                payload = resp.json()
+                # If email_verified is present, ensure it is True
+                if payload.get("email") and not payload.get("email_verified", True):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Google account email is not verified.",
+                    )
+                return payload
             else:
                 error_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
                 error_desc = error_data.get("error_description", resp.text)
@@ -235,6 +267,12 @@ async def authenticate_google_user(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Google profile does not contain an email address.",
+        )
+
+    if user_info.get("email_verified") is False:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Google profile email is not verified.",
         )
 
     # Prefer 'name', then 'given_name', then email prefix

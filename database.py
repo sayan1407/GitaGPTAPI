@@ -2,6 +2,7 @@ import os
 import time
 from contextlib import contextmanager
 import psycopg2
+import psycopg2.pool
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
@@ -9,15 +10,36 @@ load_dotenv(override=True)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+_pool = None
+
+
+def get_connection_pool():
+    global _pool
+    if _pool is None or _pool.closed:
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=DATABASE_URL,
+        )
+    return _pool
+
 
 @contextmanager
 def get_db_connection():
-    """Context manager for acquiring and closing a database connection."""
-    conn = psycopg2.connect(DATABASE_URL)
+    """Context manager for acquiring and releasing a connection from the pool."""
+    pool = get_connection_pool()
+    conn = pool.getconn()
     try:
+        if conn.closed:
+            conn = pool.getconn()
         yield conn
+    except Exception:
+        if not conn.closed:
+            conn.rollback()
+        raise
     finally:
-        conn.close()
+        if not pool.closed:
+            pool.putconn(conn)
 
 
 def init_db():
@@ -61,7 +83,7 @@ def init_db():
         conn.commit()
 
 
-def save_user_if_new(email: str, username: str) -> tuple[dict, bool]:
+def save_user_if_new(email: str, username: str, conn=None) -> tuple[dict, bool]:
     """
     Checks if a user with the provided email exists in Neon PostgreSQL.
     If the user does not exist, inserts a new user record.
@@ -71,8 +93,8 @@ def save_user_if_new(email: str, username: str) -> tuple[dict, bool]:
     clean_email = email.strip().lower()
     clean_username = username.strip() if username else clean_email.split("@")[0]
 
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+    def _execute(c):
+        with c.cursor(cursor_factory=RealDictCursor) as cur:
             # Check if user already exists
             cur.execute(
                 "SELECT id, username, email, created_at FROM users WHERE LOWER(email) = %s;",
@@ -93,7 +115,8 @@ def save_user_if_new(email: str, username: str) -> tuple[dict, bool]:
                 (clean_username, clean_email),
             )
             inserted_user = cur.fetchone()
-            conn.commit()
+            if conn is None:
+                c.commit()
 
             if inserted_user:
                 return dict(inserted_user), True
@@ -106,12 +129,18 @@ def save_user_if_new(email: str, username: str) -> tuple[dict, bool]:
                 user = cur.fetchone()
                 return dict(user) if user else {"username": clean_username, "email": clean_email}, False
 
+    if conn is not None:
+        return _execute(conn)
+    with get_db_connection() as c:
+        return _execute(c)
 
-def get_or_create_user(email: str, username: str = "") -> dict:
+
+def get_or_create_user(email: str, username: str = "", conn=None) -> dict:
     """Gets an existing user by email or creates a new one."""
     clean_email = email.strip().lower()
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+    def _execute(c):
+        with c.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 "SELECT id, username, email, created_at FROM users WHERE LOWER(email) = %s;",
                 (clean_email,),
@@ -119,8 +148,13 @@ def get_or_create_user(email: str, username: str = "") -> dict:
             existing_user = cur.fetchone()
             if existing_user:
                 return dict(existing_user)
-    user, _ = save_user_if_new(email=clean_email, username=username)
-    return user
+        user, _ = save_user_if_new(email=clean_email, username=username, conn=c)
+        return user
+
+    if conn is not None:
+        return _execute(conn)
+    with get_db_connection() as c:
+        return _execute(c)
 
 
 def get_user_sessions(user_email: str) -> list[dict]:
@@ -192,22 +226,29 @@ def get_user_sessions(user_email: str) -> list[dict]:
             return result
 
 
-def upsert_session(user_email: str, session: dict) -> dict:
+def upsert_session(user_email: str, session: dict, conn=None) -> dict:
     """
     Inserts or updates a complete chat session and its messages.
+    Enforces ownership validation to prevent cross-user session tampering (BOLA).
     """
-    user = get_or_create_user(user_email)
-    user_id = user["id"]
+    def _execute(c):
+        user = get_or_create_user(user_email, conn=c)
+        user_id = user["id"]
 
-    session_id = session["id"]
-    title = session.get("title") or "New Conversation"
-    current_ms = int(time.time() * 1000)
-    created_at = int(session.get("createdAt") or session.get("created_at") or current_ms)
-    updated_at = int(session.get("updatedAt") or session.get("updated_at") or current_ms)
-    previous_response_id = session.get("previousResponseId") or session.get("previous_response_id")
+        session_id = session["id"]
+        title = session.get("title") or "New Conversation"
+        current_ms = int(time.time() * 1000)
+        created_at = int(session.get("createdAt") or session.get("created_at") or current_ms)
+        updated_at = int(session.get("updatedAt") or session.get("updated_at") or current_ms)
+        previous_response_id = session.get("previousResponseId") or session.get("previous_response_id")
 
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with c.cursor(cursor_factory=RealDictCursor) as cur:
+            # Check ownership if session already exists
+            cur.execute("SELECT user_id FROM chat_sessions WHERE id = %s;", (session_id,))
+            existing = cur.fetchone()
+            if existing and existing["user_id"] != user_id:
+                raise PermissionError("Access denied: Cannot overwrite a session belonging to another user.")
+
             cur.execute(
                 """
                 INSERT INTO chat_sessions (id, user_id, title, previous_response_id, created_at, updated_at)
@@ -216,6 +257,7 @@ def upsert_session(user_email: str, session: dict) -> dict:
                     title = EXCLUDED.title,
                     previous_response_id = EXCLUDED.previous_response_id,
                     updated_at = EXCLUDED.updated_at
+                WHERE chat_sessions.user_id = EXCLUDED.user_id
                 RETURNING id, title, previous_response_id, created_at, updated_at;
                 """,
                 (session_id, user_id, title, previous_response_id, created_at, updated_at),
@@ -253,21 +295,29 @@ def upsert_session(user_email: str, session: dict) -> dict:
                     "responseId": m_row["response_id"],
                     "error": bool(m_row["error"]),
                 })
-        conn.commit()
 
-    return {
-        "id": saved_session["id"],
-        "title": saved_session["title"],
-        "createdAt": int(saved_session["created_at"]),
-        "updatedAt": int(saved_session["updated_at"]),
-        "previousResponseId": saved_session["previous_response_id"],
-        "messages": saved_messages,
-    }
+            if conn is None:
+                c.commit()
+
+        return {
+            "id": saved_session["id"],
+            "title": saved_session["title"],
+            "createdAt": int(saved_session["created_at"]),
+            "updatedAt": int(saved_session["updated_at"]),
+            "previousResponseId": saved_session["previous_response_id"],
+            "messages": saved_messages,
+        }
+
+    if conn is not None:
+        return _execute(conn)
+    with get_db_connection() as c:
+        return _execute(c)
 
 
 def save_message(user_email: str, session_id: str, message: dict) -> dict:
     """
     Appends or updates a single message in a session, and updates the session's timestamp.
+    Strictly verifies ownership to prevent cross-user message injection (BOLA).
     """
     user = get_or_create_user(user_email)
     user_id = user["id"]
@@ -284,11 +334,14 @@ def save_message(user_email: str, session_id: str, message: dict) -> dict:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Ensure session exists and belongs to user
             cur.execute(
-                "SELECT id FROM chat_sessions WHERE id = %s AND user_id = %s;",
-                (session_id, user_id),
+                "SELECT id, user_id FROM chat_sessions WHERE id = %s;",
+                (session_id,),
             )
             session_row = cur.fetchone()
-            if not session_row:
+            if session_row:
+                if session_row["user_id"] != user_id:
+                    raise PermissionError("Access denied: Cannot add messages to another user's session.")
+            else:
                 cur.execute(
                     """
                     INSERT INTO chat_sessions (id, user_id, title, previous_response_id, created_at, updated_at)
@@ -297,6 +350,10 @@ def save_message(user_email: str, session_id: str, message: dict) -> dict:
                     """,
                     (session_id, user_id, "New Conversation", response_id, timestamp, timestamp),
                 )
+                cur.execute("SELECT user_id FROM chat_sessions WHERE id = %s;", (session_id,))
+                check_sess = cur.fetchone()
+                if not check_sess or check_sess["user_id"] != user_id:
+                    raise PermissionError("Access denied: Cannot add messages to another user's session.")
 
             cur.execute(
                 """
@@ -421,8 +478,10 @@ def clear_user_sessions(user_email: str) -> int:
 
 
 def batch_sync_sessions(user_email: str, sessions: list[dict]) -> list[dict]:
-    """Syncs a batch of chat sessions to the database."""
+    """Syncs a batch of chat sessions to the database using a single connection and transaction."""
     synced = []
-    for session in sessions:
-        synced.append(upsert_session(user_email, session))
+    with get_db_connection() as conn:
+        for session in sessions:
+            synced.append(upsert_session(user_email, session, conn=conn))
+        conn.commit()
     return synced
