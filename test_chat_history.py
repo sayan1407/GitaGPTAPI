@@ -344,3 +344,154 @@ def test_message_ordering_with_identical_timestamps():
             cur.execute("DELETE FROM users WHERE LOWER(email) = %s;", (test_email.lower(),))
         conn.commit()
 
+
+def test_multi_browser_concurrent_session_no_duplicate_order_index():
+    """
+    Simulates a session opened in two different browser tabs concurrently:
+    Tab A sends new messages and saves the session.
+    Tab B (which still has stale in-memory message list from before Tab A's messages)
+    sends new messages and saves the session.
+    Verifies that no orderIndex is duplicated and all messages are ordered cleanly.
+    """
+    from auth import create_user_access_token
+    client = TestClient(app)
+    uid = uuid.uuid4().hex[:8]
+    test_email = f"multitab_{uid}@example.com"
+    token = create_user_access_token(test_email, f"MultiTab User {uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_id = f"sess_multitab_{uid}"
+    now_ms = int(time.time() * 1000)
+
+    # Initial session with 2 messages
+    initial_payload = {
+        "session": {
+            "id": session_id,
+            "title": "Multi-Tab Test Conversation",
+            "createdAt": now_ms,
+            "updatedAt": now_ms,
+            "messages": [
+                {
+                    "id": f"msg_init_u_{uid}",
+                    "role": "user",
+                    "content": "Initial question",
+                    "timestamp": now_ms,
+                },
+                {
+                    "id": f"msg_init_a_{uid}",
+                    "role": "assistant",
+                    "content": "Initial answer",
+                    "timestamp": now_ms + 10,
+                },
+            ],
+        }
+    }
+    res = client.put(f"/sessions/{session_id}", headers=headers, json=initial_payload)
+    assert res.status_code == 200
+
+    # Tab A adds 2 messages
+    tab_a_payload = {
+        "session": {
+            "id": session_id,
+            "title": "Multi-Tab Test Conversation",
+            "createdAt": now_ms,
+            "updatedAt": now_ms + 100,
+            "messages": [
+                {
+                    "id": f"msg_init_u_{uid}",
+                    "role": "user",
+                    "content": "Initial question",
+                    "timestamp": now_ms,
+                },
+                {
+                    "id": f"msg_init_a_{uid}",
+                    "role": "assistant",
+                    "content": "Initial answer",
+                    "timestamp": now_ms + 10,
+                },
+                {
+                    "id": f"msg_tab_a_u_{uid}",
+                    "role": "user",
+                    "content": "Question from Tab A",
+                    "timestamp": now_ms + 100,
+                },
+                {
+                    "id": f"msg_tab_a_a_{uid}",
+                    "role": "assistant",
+                    "content": "Answer in Tab A",
+                    "timestamp": now_ms + 110,
+                },
+            ],
+        }
+    }
+    res_a = client.put(f"/sessions/{session_id}", headers=headers, json=tab_a_payload)
+    assert res_a.status_code == 200
+
+    # Tab B had only the initial 2 messages in memory when Tab A saved.
+    # Now Tab B sends its own new messages:
+    tab_b_payload = {
+        "session": {
+            "id": session_id,
+            "title": "Multi-Tab Test Conversation",
+            "createdAt": now_ms,
+            "updatedAt": now_ms + 200,
+            "messages": [
+                {
+                    "id": f"msg_init_u_{uid}",
+                    "role": "user",
+                    "content": "Initial question",
+                    "timestamp": now_ms,
+                },
+                {
+                    "id": f"msg_init_a_{uid}",
+                    "role": "assistant",
+                    "content": "Initial answer",
+                    "timestamp": now_ms + 10,
+                },
+                {
+                    "id": f"msg_tab_b_u_{uid}",
+                    "role": "user",
+                    "content": "Question from Tab B",
+                    "timestamp": now_ms + 200,
+                },
+                {
+                    "id": f"msg_tab_b_a_{uid}",
+                    "role": "assistant",
+                    "content": "Answer in Tab B",
+                    "timestamp": now_ms + 210,
+                },
+            ],
+        }
+    }
+    res_b = client.put(f"/sessions/{session_id}", headers=headers, json=tab_b_payload)
+    assert res_b.status_code == 200
+
+    # Verify session messages
+    res = client.get("/sessions", headers=headers)
+    assert res.status_code == 200
+    sessions = res.json()
+    assert len(sessions) == 1
+    msgs = sessions[0]["messages"]
+
+    # All 6 messages should be present
+    assert len(msgs) == 6
+
+    # Verify order indices are strictly sequential without ANY duplicates [0, 1, 2, 3, 4, 5]
+    indices = [m["orderIndex"] for m in msgs]
+    assert indices == [0, 1, 2, 3, 4, 5]
+
+    # Verify message sequence: initial, Tab A, Tab B
+    assert msgs[0]["id"] == f"msg_init_u_{uid}"
+    assert msgs[1]["id"] == f"msg_init_a_{uid}"
+    assert msgs[2]["id"] == f"msg_tab_a_u_{uid}"
+    assert msgs[3]["id"] == f"msg_tab_a_a_{uid}"
+    assert msgs[4]["id"] == f"msg_tab_b_u_{uid}"
+    assert msgs[5]["id"] == f"msg_tab_b_a_{uid}"
+
+    # Cleanup
+    with database.get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM users WHERE LOWER(email) = %s;", (test_email.lower(),))
+        conn.commit()
+
+

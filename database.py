@@ -76,10 +76,12 @@ def init_db():
     );
 
     ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS order_index INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
 
     CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id);
     CREATE INDEX IF NOT EXISTS idx_chat_messages_timestamp ON chat_messages(timestamp ASC);
     CREATE INDEX IF NOT EXISTS idx_chat_messages_session_order ON chat_messages(session_id, order_index ASC);
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_session_seq ON chat_messages(session_id, seq ASC);
     """
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -194,10 +196,10 @@ def get_user_sessions(user_email: str) -> list[dict]:
             session_ids = [s["id"] for s in sessions]
             cur.execute(
                 """
-                SELECT id, session_id, role, content, timestamp, response_id, error, order_index
+                SELECT id, session_id, role, content, timestamp, response_id, error, order_index, seq
                 FROM chat_messages
                 WHERE session_id = ANY(%s)
-                ORDER BY order_index ASC, timestamp ASC;
+                ORDER BY seq ASC, order_index ASC, timestamp ASC;
                 """,
                 (session_ids,),
             )
@@ -208,6 +210,7 @@ def get_user_sessions(user_email: str) -> list[dict]:
             for msg in all_messages:
                 s_id = msg["session_id"]
                 if s_id in messages_by_session:
+                    idx = len(messages_by_session[s_id])
                     messages_by_session[s_id].append({
                         "id": msg["id"],
                         "role": msg["role"],
@@ -215,7 +218,7 @@ def get_user_sessions(user_email: str) -> list[dict]:
                         "timestamp": int(msg["timestamp"]),
                         "responseId": msg["response_id"],
                         "error": bool(msg["error"]),
-                        "orderIndex": int(msg["order_index"]) if msg.get("order_index") is not None else 0,
+                        "orderIndex": idx,
                     })
 
             result = []
@@ -278,25 +281,44 @@ def upsert_session(user_email: str, session: dict, conn=None) -> dict:
                 timestamp = int(msg.get("timestamp") or current_ms)
                 response_id = msg.get("responseId") or msg.get("response_id")
                 error = bool(msg.get("error", False))
-                order_index = msg.get("orderIndex")
-                if order_index is None:
-                    order_index = msg.get("order_index")
-                if order_index is None:
-                    order_index = idx
 
+                # Check if message already exists
                 cur.execute(
-                    """
-                    INSERT INTO chat_messages (id, session_id, role, content, timestamp, response_id, error, order_index)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        content = EXCLUDED.content,
-                        response_id = EXCLUDED.response_id,
-                        error = EXCLUDED.error,
-                        order_index = EXCLUDED.order_index
-                    RETURNING id, role, content, timestamp, response_id, error, order_index;
-                    """,
-                    (msg_id, session_id, role, content, timestamp, response_id, error, int(order_index)),
+                    "SELECT order_index, seq FROM chat_messages WHERE id = %s;",
+                    (msg_id,),
                 )
+                existing_msg = cur.fetchone()
+
+                if existing_msg is None:
+                    # New message: assign next order_index in session atomically
+                    cur.execute(
+                        "SELECT COALESCE(MAX(order_index), -1) + 1 AS next_idx FROM chat_messages WHERE session_id = %s;",
+                        (session_id,),
+                    )
+                    next_order = cur.fetchone()["next_idx"]
+
+                    cur.execute(
+                        """
+                        INSERT INTO chat_messages (id, session_id, role, content, timestamp, response_id, error, order_index)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            content = EXCLUDED.content,
+                            response_id = EXCLUDED.response_id,
+                            error = EXCLUDED.error
+                        RETURNING id, role, content, timestamp, response_id, error, order_index, seq;
+                        """,
+                        (msg_id, session_id, role, content, timestamp, response_id, error, int(next_order)),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE chat_messages
+                        SET content = %s, response_id = %s, error = %s
+                        WHERE id = %s
+                        RETURNING id, role, content, timestamp, response_id, error, order_index, seq;
+                        """,
+                        (content, response_id, error, msg_id),
+                    )
                 m_row = cur.fetchone()
                 saved_messages.append({
                     "id": m_row["id"],
@@ -370,26 +392,42 @@ def save_message(user_email: str, session_id: str, message: dict) -> dict:
                 if not check_sess or check_sess["user_id"] != user_id:
                     raise PermissionError("Access denied: Cannot add messages to another user's session.")
 
-            if order_index is None:
+            # Check if message already exists
+            cur.execute(
+                "SELECT order_index, seq FROM chat_messages WHERE id = %s;",
+                (msg_id,),
+            )
+            existing_msg = cur.fetchone()
+
+            if existing_msg is None:
                 cur.execute(
                     "SELECT COALESCE(MAX(order_index), -1) + 1 AS next_idx FROM chat_messages WHERE session_id = %s;",
                     (session_id,),
                 )
                 order_index = cur.fetchone()["next_idx"]
 
-            cur.execute(
-                """
-                INSERT INTO chat_messages (id, session_id, role, content, timestamp, response_id, error, order_index)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (id) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    response_id = EXCLUDED.response_id,
-                    error = EXCLUDED.error,
-                    order_index = EXCLUDED.order_index
-                RETURNING id, role, content, timestamp, response_id, error, order_index;
-                """,
-                (msg_id, session_id, role, content, timestamp, response_id, error, int(order_index)),
-            )
+                cur.execute(
+                    """
+                    INSERT INTO chat_messages (id, session_id, role, content, timestamp, response_id, error, order_index)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        content = EXCLUDED.content,
+                        response_id = EXCLUDED.response_id,
+                        error = EXCLUDED.error
+                    RETURNING id, role, content, timestamp, response_id, error, order_index, seq;
+                    """,
+                    (msg_id, session_id, role, content, timestamp, response_id, error, int(order_index)),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE chat_messages
+                    SET content = %s, response_id = %s, error = %s
+                    WHERE id = %s
+                    RETURNING id, role, content, timestamp, response_id, error, order_index, seq;
+                    """,
+                    (content, response_id, error, msg_id),
+                )
             m_row = cur.fetchone()
 
             # Update session timestamp and previous_response_id
